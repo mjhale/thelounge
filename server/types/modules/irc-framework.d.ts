@@ -218,11 +218,7 @@ declare module "irc-framework" {
 
 		ctcpResponse(target: string, type: string, ...params: Array<string>): void;
 
-		action(
-			target: string,
-			message: string,
-			tags?: {[key: string]: string | boolean}
-		): string[];
+		action(target: string, message: string, tags?: {[key: string]: string | boolean}): string[];
 
 		tagmsg(target: string, tags: {[key: string]: string}): void;
 
@@ -238,6 +234,16 @@ declare module "irc-framework" {
 		who(target: string, cb: (event: any) => void): void;
 
 		list(...params: Array<string>): void;
+
+		addMonitor(target: string): void;
+
+		removeMonitor(target: string): void;
+
+		queryMonitor(): void;
+
+		clearMonitor(): void;
+
+		monitorlist(cb: (event: {nicks: string[]}) => void): void;
 
 		channel(channel_name: string): IrcChannel;
 
@@ -303,6 +309,16 @@ declare module "irc-framework" {
 				account?: any;
 				batch?: any;
 			}) => any
+		): this;
+
+		on(
+			eventType: "users online",
+			cb: (event: {nicks: string[]; tags: Record<string, string>}) => any
+		): this;
+
+		on(
+			eventType: "users offline",
+			cb: (event: {nicks: string[]; tags: Record<string, string>}) => any
 		): this;
 	}
 	export class Message {
