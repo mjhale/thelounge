@@ -512,7 +512,13 @@ class Client {
 				return;
 			}
 
-			plugin.input.apply(client, [target.network, target.chan, cmd, args]);
+			plugin.input.apply(client, [
+				target.network,
+				target.chan,
+				cmd,
+				args,
+				{replyTo: data.replyTo},
+			]);
 			return;
 		}
 
