@@ -16,6 +16,7 @@
     "build:client": "vite build",
     "build:server": "tsc -p server/tsconfig.json",
     "build": "run-p --aggregate-output build:client build:server",
+    "benchmark:client": "tsx test/benchmark/clientPerformance.ts",
     "coverage": "vitest run --coverage",
     "dev": "cross-env NODE_ENV=development ts-node --project server/tsconfig.json server/index.ts start --dev",
     "format:prettier": "prettier --write \"**/*.*\"",
