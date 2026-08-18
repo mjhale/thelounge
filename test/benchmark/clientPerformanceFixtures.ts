@@ -18,6 +18,8 @@ export function makeMessage(id: number): SharedMsg {
 	const cycle = Math.abs(id) % 20;
 	const nick = `user-${Math.abs(id) % 37}`;
 	const from = {nick, mode: ""};
+	const dayIndex = Math.floor((id + 10) / 240);
+	const secondWithinDay = (id + 10) % 240;
 	const message: SharedMsg = {
 		from,
 		hostmask: `${nick}!benchmark@invalid`,
@@ -25,7 +27,7 @@ export function makeMessage(id: number): SharedMsg {
 		msgid: `bench-${id}`,
 		text: `Synthetic message ${id} with #benchmark, user-1, emoji ✅, and \u0002style\u000f`,
 		type: MessageType.MESSAGE,
-		time: new Date(baseTime + id * 1000),
+		time: new Date(baseTime + dayIndex * 86_400_000 + secondWithinDay * 1000),
 		users: [],
 	};
 

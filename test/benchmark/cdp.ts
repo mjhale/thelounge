@@ -196,6 +196,7 @@ export async function launchChrome(
 		deviceScaleFactor: 1,
 		mobile: false,
 	});
+	await cdp.send("Emulation.setTimezoneOverride", {timezoneId: "UTC"});
 
 	if (cpuRate !== 1) {
 		await cdp.send("Emulation.setCPUThrottlingRate", {rate: cpuRate});
@@ -253,6 +254,51 @@ export async function evaluate<T>(
 	return response.result.value as T;
 }
 
+export async function callFunction<T>(
+	cdp: CdpClient,
+	functionDeclaration: string,
+	values: readonly unknown[] = []
+): Promise<T> {
+	const globalResponse = await withTimeout(
+		cdp.send("Runtime.evaluate", {
+			expression: "globalThis",
+			returnByValue: false,
+		}),
+		60000,
+		"Chrome main thread did not expose the global object within 60 seconds"
+	);
+
+	if (globalResponse.exceptionDetails) {
+		throw new Error(globalResponse.exceptionDetails.exception?.description ?? "globalThis");
+	}
+
+	const objectId = globalResponse.result.objectId;
+
+	try {
+		const response = await withTimeout(
+			cdp.send("Runtime.callFunctionOn", {
+				objectId,
+				functionDeclaration,
+				arguments: values.map((value) => ({value})),
+				awaitPromise: true,
+				returnByValue: true,
+			}),
+			60000,
+			"Chrome main thread did not finish the parameterized function within 60 seconds"
+		);
+
+		if (response.exceptionDetails) {
+			throw new Error(
+				response.exceptionDetails.exception?.description ?? functionDeclaration
+			);
+		}
+
+		return response.result.value as T;
+	} finally {
+		await cdp.send("Runtime.releaseObject", {objectId});
+	}
+}
+
 export async function waitForExpression(
 	cdp: CdpClient,
 	expression: string,
@@ -269,6 +315,25 @@ export async function waitForExpression(
 	}
 
 	throw new Error(`Timed out waiting for browser expression: ${expression}`);
+}
+
+export async function waitForFunction(
+	cdp: CdpClient,
+	functionDeclaration: string,
+	values: readonly unknown[] = [],
+	timeoutMs = 60000
+): Promise<void> {
+	const startedAt = Date.now();
+
+	while (Date.now() - startedAt < timeoutMs) {
+		if (await callFunction<boolean>(cdp, functionDeclaration, values)) {
+			return;
+		}
+
+		await delay(25);
+	}
+
+	throw new Error(`Timed out waiting for parameterized browser function: ${functionDeclaration}`);
 }
 
 export async function collectHeap(cdp: CdpClient): Promise<number> {
@@ -326,6 +391,56 @@ async function waitUntil(
 
 const benchmarkInstrumentation = String.raw`
 (() => {
+	const trackedListeners = new WeakMap();
+	const nativeAddEventListener = EventTarget.prototype.addEventListener;
+	const nativeRemoveEventListener = EventTarget.prototype.removeEventListener;
+	const captureEnabled = (options) =>
+		typeof options === "boolean" ? options : Boolean(options?.capture);
+	const trackedSet = (target, type, capture) => {
+		let targetListeners = trackedListeners.get(target);
+		if (!targetListeners) {
+			targetListeners = new Map();
+			trackedListeners.set(target, targetListeners);
+		}
+
+		const key = type + ":" + Number(capture);
+		let listeners = targetListeners.get(key);
+		if (!listeners) {
+			listeners = new Set();
+			targetListeners.set(key, listeners);
+		}
+		return listeners;
+	};
+	EventTarget.prototype.addEventListener = function(type, listener, options) {
+		const result = nativeAddEventListener.call(this, type, listener, options);
+		if (listener) {
+			trackedSet(this, type, captureEnabled(options)).add(listener);
+		}
+		return result;
+	};
+	EventTarget.prototype.removeEventListener = function(type, listener, options) {
+		const result = nativeRemoveEventListener.call(this, type, listener, options);
+		if (listener) {
+			trackedSet(this, type, captureEnabled(options)).delete(listener);
+		}
+		return result;
+	};
+	const listenerCount = (target, predicate) => {
+		const targetListeners = trackedListeners.get(target);
+		if (!targetListeners) {
+			return 0;
+		}
+
+		let total = 0;
+		for (const [key, listeners] of targetListeners) {
+			const type = key.slice(0, key.lastIndexOf(":"));
+			if (predicate(type)) {
+				total += listeners.size;
+			}
+		}
+		return total;
+	};
+
 	// History pages are requested explicitly by the harness. This prevents the
 	// load-more observer and a scripted click from racing for the same cursor.
 	Object.defineProperty(window, "IntersectionObserver", {
@@ -344,10 +459,15 @@ const benchmarkInstrumentation = String.raw`
 		inputSamples: [],
 		probeTimer: null,
 		probeExpected: 0,
+		recordLongTasks: true,
 	};
 	const probeInterval = 100;
 
 	new PerformanceObserver((list) => {
+		if (!state.recordLongTasks) {
+			return;
+		}
+
 		for (const entry of list.getEntries()) {
 			state.longTasks.push({startTime: entry.startTime, duration: entry.duration});
 		}
@@ -376,9 +496,19 @@ const benchmarkInstrumentation = String.raw`
 
 	window.__tlBenchmark = {
 		state,
+		listenerSnapshot() {
+			return {
+				windowResize: listenerCount(window, (type) => type === "resize"),
+				documentTouch: listenerCount(document, (type) => type.startsWith("touch")),
+				messageTouch: [...document.querySelectorAll("#chat .messages .msg")]
+					.reduce((total, element) =>
+						total + listenerCount(element, (type) => type.startsWith("touch")), 0),
+			};
+		},
 		reset() {
 			state.longTasks = [];
 			state.inputSamples = [];
+			state.recordLongTasks = true;
 			return performance.now();
 		},
 		startInputProbe() {
@@ -428,15 +558,18 @@ const benchmarkInstrumentation = String.raw`
 			await twoFrames();
 			const relevantTasks = state.longTasks.filter((task) => task.startTime >= startedAt);
 			const durations = relevantTasks.map((task) => task.duration);
-			return {
+			const result = {
 				durationMs: performance.now() - startedAt,
 				longTasks: summarize(durations),
 				totalBlockingTimeMs: durations.reduce((total, duration) => total + Math.max(0, duration - 50), 0),
 			};
+			state.recordLongTasks = false;
+			state.longTasks = [];
+			return result;
 		},
 		async initial() {
 			await twoFrames();
-			return {
+			const result = {
 				durationMs: performance.now() - state.navigationStart,
 				longTasks: summarize(state.longTasks.map((task) => task.duration)),
 				totalBlockingTimeMs: state.longTasks.reduce(
@@ -444,6 +577,9 @@ const benchmarkInstrumentation = String.raw`
 					0
 				),
 			};
+			state.recordLongTasks = false;
+			state.longTasks = [];
+			return result;
 		},
 	};
 })();
