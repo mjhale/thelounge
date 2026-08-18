@@ -1,7 +1,7 @@
 import type {ClientMessage} from "../types";
 
-export const messageWindowSize = 500;
-export const messageWindowStep = 250;
+export const messageWindowSize = 250;
+export const messageWindowStep = 125;
 
 export type MessageWindow = {
 	start: number;
@@ -47,14 +47,48 @@ export function getWindowStartForIndex(length: number, index: number): number {
 	return getMessageWindow(length, index - Math.floor(messageWindowSize / 2)).start;
 }
 
+export function getFirstMessageIndexAfterId(
+	messages: readonly ClientMessage[],
+	messageId: number
+): number {
+	let low = 0;
+	let high = messages.length;
+
+	while (low < high) {
+		const middle = Math.floor((low + high) / 2);
+
+		if (messages[middle].id <= messageId) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+
+	return low;
+}
+
+export function getMessageIndexById(messages: readonly ClientMessage[], messageId: number): number {
+	const index = getFirstMessageIndexAfterId(messages, messageId - 1);
+	return messages[index]?.id === messageId ? index : -1;
+}
+
 export function reconcileMessageWindow(
 	start: number,
 	previous: MessageCollectionSignature,
 	current: MessageCollectionSignature,
-	atBottom: boolean
+	atBottom: boolean,
+	preservedIndex = -1
 ): number {
 	if (atBottom || current.length <= messageWindowSize) {
 		return getTailWindowStart(current.length);
+	}
+
+	if (
+		current.length === previous.length &&
+		current.firstId === previous.firstId &&
+		current.lastId === previous.lastId
+	) {
+		return getMessageWindow(current.length, start).start;
 	}
 
 	const prepended =
@@ -63,7 +97,11 @@ export function reconcileMessageWindow(
 		current.firstId !== previous.firstId;
 
 	if (prepended) {
-		return getMessageWindow(current.length, start + current.length - previous.length).start;
+		const loadedCount = current.length - previous.length;
+		return getMessageWindow(
+			current.length,
+			start + loadedCount - Math.min(messageWindowStep, loadedCount)
+		).start;
 	}
 
 	const appended =
@@ -73,6 +111,10 @@ export function reconcileMessageWindow(
 
 	if (appended) {
 		return getMessageWindow(current.length, start).start;
+	}
+
+	if (preservedIndex >= 0) {
+		return getMessageWindow(current.length, preservedIndex).start;
 	}
 
 	return getTailWindowStart(current.length);
@@ -88,14 +130,37 @@ export function getMessageCollectionSignature(
 	};
 }
 
-export function createMessageIdSet(messages: readonly ClientMessage[]): ReadonlySet<string> {
-	const messageIds = new Set<string>();
+export function createMessageIdIndex(messages: readonly ClientMessage[]): Map<string, number> {
+	const messageIds = new Map<string, number>();
 
 	for (const message of messages) {
-		if (message.msgid) {
-			messageIds.add(message.msgid);
-		}
+		addMessageId(messageIds, message);
 	}
 
 	return messageIds;
+}
+
+export function addMessageId(messageIds: Map<string, number>, message: ClientMessage): void {
+	if (message.msgid) {
+		messageIds.set(message.msgid, (messageIds.get(message.msgid) ?? 0) + 1);
+	}
+}
+
+export function removeMessageIds(
+	messageIds: Map<string, number>,
+	messages: readonly ClientMessage[]
+): void {
+	for (const message of messages) {
+		if (!message.msgid) {
+			continue;
+		}
+
+		const count = messageIds.get(message.msgid) ?? 0;
+
+		if (count > 1) {
+			messageIds.set(message.msgid, count - 1);
+		} else {
+			messageIds.delete(message.msgid);
+		}
+	}
 }

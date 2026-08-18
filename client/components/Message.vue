@@ -148,9 +148,17 @@ export default defineComponent({
 		message: {type: Object as PropType<ClientMessage>, required: true},
 		channel: {type: Object as PropType<ClientChan>, required: false},
 		network: {type: Object as PropType<ClientNetwork>, required: true},
-		keepScrollPosition: Function as PropType<() => void>,
+		keepScrollPosition: {
+			type: Function as PropType<() => void>,
+			default() {},
+		},
 		isPreviousSource: Boolean,
 		focused: Boolean,
+		messageIds: {
+			type: Object as PropType<ReadonlyMap<string, number>>,
+			required: false,
+		},
+		revealMessage: Function as PropType<(msgid: string) => Promise<void>>,
 	},
 	setup(props) {
 		const store = useStore();
@@ -197,7 +205,9 @@ export default defineComponent({
 				return false;
 			}
 
-			return props.channel.messages.some((m) => m.msgid === props.message.replyTo);
+			return props.messageIds
+				? props.messageIds.has(props.message.replyTo)
+				: props.channel.messages.some((m) => m.msgid === props.message.replyTo);
 		});
 
 		const isAction = () => {
@@ -216,10 +226,12 @@ export default defineComponent({
 			});
 		};
 
-		const scrollToParent = () => {
+		const scrollToParent = async () => {
 			if (!props.message.replyTo) {
 				return;
 			}
+
+			await props.revealMessage?.(props.message.replyTo);
 
 			const el = document.querySelector(
 				`.msg[data-msgid="${CSS.escape(props.message.replyTo)}"]`

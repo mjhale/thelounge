@@ -79,6 +79,7 @@ import type {ClientNetwork, ClientChan} from "../js/types";
 import {useStore} from "../js/store";
 import {ChanType} from "../../shared/types/chan";
 import type {TypingStatus} from "../../shared/types/typing";
+import {getInputHeightChange} from "../js/helpers/inputHeight";
 
 const TYPING_THROTTLE_MS = 3000;
 
@@ -118,6 +119,7 @@ export default defineComponent({
 		const input = ref<HTMLTextAreaElement>();
 		const uploadInput = ref<HTMLInputElement>();
 		const autocompletionRef = ref<ReturnType<typeof autocompletion>>();
+		let inputHeight = 0;
 		let lastTypingSent = 0;
 		let typingPauseTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -148,9 +150,17 @@ export default defineComponent({
 				// Use scrollHeight to calculate how many lines there are in input, and ceil the value
 				// because some browsers tend to incorrently round the values when using high density
 				// displays or using page zoom feature
-				input.value.style.height = `${
-					Math.ceil(input.value.scrollHeight / lineHeight) * lineHeight
-				}px`;
+				const result = getInputHeightChange(
+					inputHeight,
+					input.value.scrollHeight,
+					lineHeight
+				);
+				input.value.style.height = `${result.height}px`;
+				inputHeight = result.height;
+
+				if (result.changed) {
+					eventbus.emit("resize");
+				}
 			});
 		};
 
@@ -180,7 +190,6 @@ export default defineComponent({
 			const text = (e.target as HTMLInputElement).value;
 			props.channel.pendingMessage = text;
 			props.channel.inputHistoryPosition = 0;
-			setInputSize();
 
 			// No need to send typing indicators for / commands
 			if (text.length > 0 && text[0] !== "/") {
@@ -295,6 +304,7 @@ export default defineComponent({
 
 		const cancelReply = () => {
 			props.channel.replyingTo = null;
+			void nextTick(() => eventbus.emit("resize"));
 		};
 
 		const onReplyStart = (data: {msgid: string; nick: string; text: string}) => {
@@ -307,6 +317,7 @@ export default defineComponent({
 				nick: data.nick || "Unknown",
 				text: data.text || "",
 			};
+			void nextTick(() => eventbus.emit("resize"));
 
 			// Pre-fill with "nick: " so clients without +reply support
 			// can still see who the reply is directed at
@@ -337,6 +348,9 @@ export default defineComponent({
 		watch(
 			() => props.channel.id,
 			() => {
+				inputHeight = 0;
+				setInputSize();
+
 				if (autocompletionRef.value) {
 					autocompletionRef.value.hide();
 				}
@@ -353,6 +367,7 @@ export default defineComponent({
 		onMounted(() => {
 			eventbus.on("escapekey", onEscape);
 			eventbus.on("reply:start", onReplyStart);
+			setInputSize();
 
 			if (store.state.settings.autocomplete) {
 				if (!input.value) {

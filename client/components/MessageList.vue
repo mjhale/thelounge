@@ -1,18 +1,35 @@
 <template>
 	<div ref="chat" class="chat" tabindex="-1">
-		<div v-show="channel.moreHistoryAvailable" class="show-more">
+		<div
+			v-show="channel.moreHistoryAvailable || messageWindow.hasOlder"
+			:aria-busy="channel.historyLoading || undefined"
+			class="show-more"
+			data-message-window="older"
+		>
 			<button
 				ref="loadMoreButton"
-				:disabled="channel.historyLoading || !store.state.isConnected"
+				:aria-disabled="windowTransitioning || undefined"
+				:disabled="
+					!messageWindow.hasOlder && (channel.historyLoading || !store.state.isConnected)
+				"
 				class="btn"
-				@click="onShowMoreClick"
+				@click="showOlderMessages"
 			>
-				<span v-if="channel.historyLoading">Loading…</span>
-				<span v-else>Show older messages</span>
+				<span v-if="channel.historyLoading && !messageWindow.hasOlder">Loading…</span>
+				<span v-else-if="messageWindow.hasOlder">Show older loaded messages</span>
+				<span v-else>Load older messages</span>
 			</button>
 		</div>
 		<div
+			id="chat-messages"
+			ref="messageContainer"
 			class="messages"
+			:data-retained-count="channel.messages.length"
+			:data-retained-first-id="channel.messages[0]?.id"
+			:data-retained-last-id="channel.messages.at(-1)?.id"
+			:data-status-messages="store.state.settings.statusMessages"
+			:data-window-start="messageWindow.start"
+			:data-window-end="messageWindow.end"
 			role="log"
 			aria-live="polite"
 			aria-relevant="additions"
@@ -26,7 +43,7 @@
 					:focused="message.id === focused"
 				/>
 				<div
-					v-if="shouldDisplayUnreadMarker(Number(message.id))"
+					v-if="shouldDisplayUnreadMarker(message)"
 					:key="message.id + '-unread'"
 					class="unread-marker"
 				>
@@ -39,7 +56,9 @@
 					:network="network"
 					:keep-scroll-position="keepScrollPosition"
 					:messages="message.messages"
-					:focused="message.id === focused"
+					:message-ids="channel.messageIds"
+					:reveal-message="revealMessageByMsgid"
+					:focused="focused"
 				/>
 				<Message
 					v-else
@@ -47,12 +66,27 @@
 					:channel="channel"
 					:network="network"
 					:message="message"
+					:message-ids="channel.messageIds"
+					:reveal-message="revealMessageByMsgid"
 					:keep-scroll-position="keepScrollPosition"
 					:is-previous-source="isPreviousSource(message, id)"
 					:focused="message.id === focused"
 					@toggle-link-preview="onLinkPreviewToggle"
 				/>
 			</template>
+		</div>
+		<div
+			v-show="messageWindow.hasNewer"
+			class="show-more show-newer"
+			data-message-window="newer"
+		>
+			<button
+				:aria-disabled="windowTransitioning || undefined"
+				class="btn"
+				@click="showNewerMessages"
+			>
+				Show newer loaded messages
+			</button>
 		</div>
 	</div>
 </template>
@@ -72,7 +106,6 @@ import {
 	defineComponent,
 	nextTick,
 	onBeforeUnmount,
-	onBeforeUpdate,
 	onMounted,
 	onUnmounted,
 	PropType,
@@ -81,6 +114,17 @@ import {
 } from "vue";
 import {useStore} from "../js/store";
 import {ClientChan, ClientMessage, ClientNetwork, ClientLinkPreview} from "../js/types";
+import {beginHistoryRequest} from "../js/helpers/historyRequest";
+import {
+	getMessageCollectionSignature,
+	getFirstMessageIndexAfterId,
+	getMessageIndexById,
+	getMessageWindow,
+	getTailWindowStart,
+	getWindowStartForIndex,
+	moveMessageWindow,
+	reconcileMessageWindow,
+} from "../js/helpers/messageWindow";
 
 type CondensedMessageContainer = {
 	type: "condensed";
@@ -89,8 +133,11 @@ type CondensedMessageContainer = {
 	id?: number;
 };
 
-// TODO; move into component
-let unreadMarkerShown = false;
+type ScrollAnchor = {
+	messageId: number;
+	top: number;
+	condensed: boolean;
+};
 
 export default defineComponent({
 	name: "MessageList",
@@ -108,46 +155,65 @@ export default defineComponent({
 		const store = useStore();
 
 		const chat = ref<HTMLDivElement | null>(null);
+		const messageContainer = ref<HTMLDivElement | null>(null);
 		const loadMoreButton = ref<HTMLButtonElement | null>(null);
 		const historyObserver = ref<IntersectionObserver | null>(null);
+		const messageResizeObserver = ref<ResizeObserver | null>(null);
 		const skipNextScrollEvent = ref(false);
+		const windowTransitioning = ref(false);
+		let windowScrollAnchor: ScrollAnchor | undefined;
+		let resizeScrollAnchor: ScrollAnchor | undefined;
+		let focusedRevealSequence = 0;
+		let scrollAnchorGeneration = 0;
+		let trackedWindowFirstId =
+			props.channel.messages[
+				getMessageWindow(props.channel.messages.length, props.channel.messageWindowStart)
+					.start
+			]?.id;
 
-		const isWaitingForNextTick = ref(false);
+		const updateTrackedWindowFirstId = () => {
+			trackedWindowFirstId =
+				props.channel.messages[
+					getMessageWindow(
+						props.channel.messages.length,
+						props.channel.messageWindowStart
+					).start
+				]?.id;
+		};
 
 		const jumpToBottom = () => {
-			skipNextScrollEvent.value = true;
+			scrollAnchorGeneration++;
 			props.channel.scrolledToBottom = true;
+			props.channel.messageWindowStart = getTailWindowStart(props.channel.messages.length);
+			resizeScrollAnchor = undefined;
+			updateTrackedWindowFirstId();
 
 			const el = chat.value;
 
 			if (el) {
-				el.scrollTop = el.scrollHeight;
+				void nextTick(() => {
+					const target = Math.max(0, el.scrollHeight - el.clientHeight);
+
+					if (Math.abs(el.scrollTop - target) > 1) {
+						skipNextScrollEvent.value = true;
+						el.scrollTop = target;
+					}
+				});
 			}
 		};
 
 		const onShowMoreClick = () => {
-			if (!store.state.isConnected) {
+			const request = beginHistoryRequest(
+				props.channel,
+				store.state.isConnected,
+				store.state.settings.statusMessages !== "shown"
+			);
+
+			if (!request) {
 				return;
 			}
 
-			let lastMessage = -1;
-
-			// Find the id of first message that isn't showInActive
-			// If showInActive is set, this message is actually in another channel
-			for (const message of props.channel.messages) {
-				if (!message.showInActive) {
-					lastMessage = message.id;
-					break;
-				}
-			}
-
-			props.channel.historyLoading = true;
-
-			socket.emit("more", {
-				target: props.channel.id,
-				lastId: lastMessage,
-				condensed: store.state.settings.statusMessages !== "shown",
-			});
+			socket.emit("more", request);
 		};
 
 		const onLoadButtonObserved = (entries: IntersectionObserverEntry[]) => {
@@ -156,49 +222,46 @@ export default defineComponent({
 					return;
 				}
 
-				onShowMoreClick();
+				if (
+					!getMessageWindow(
+						props.channel.messages.length,
+						props.channel.messageWindowStart
+					).hasOlder
+				) {
+					onShowMoreClick();
+				}
 			});
 		};
 
-		nextTick(() => {
-			if (!chat.value) {
-				return;
-			}
-
-			if (window.IntersectionObserver) {
-				historyObserver.value = new window.IntersectionObserver(onLoadButtonObserved, {
-					root: chat.value,
-				});
-			}
-
-			jumpToBottom();
-		}).catch((e) => {
-			// eslint-disable-next-line no-console
-			console.error("Error in new IntersectionObserver", e);
-		});
+		const messageWindow = computed(() =>
+			getMessageWindow(props.channel.messages.length, props.channel.messageWindowStart)
+		);
+		const renderedMessages = computed(() =>
+			props.channel.messages.slice(messageWindow.value.start, messageWindow.value.end)
+		);
 
 		const condensedMessages = computed(() => {
 			if (props.channel.type !== ChanType.CHANNEL && props.channel.type !== ChanType.QUERY) {
-				return props.channel.messages;
+				return renderedMessages.value;
 			}
 
 			// If actions are hidden, just return a message list with them excluded
 			if (store.state.settings.statusMessages === "hidden") {
-				return props.channel.messages.filter(
+				return renderedMessages.value.filter(
 					(message) => !condensedTypes.has(message.type || "")
 				);
 			}
 
 			// If actions are not condensed, just return raw message list
 			if (store.state.settings.statusMessages !== "condensed") {
-				return props.channel.messages;
+				return renderedMessages.value;
 			}
 
 			let lastCondensedContainer: CondensedMessageContainer | null = null;
 
 			const condensed: (ClientMessage | CondensedMessageContainer)[] = [];
 
-			for (const message of props.channel.messages) {
+			for (const message of renderedMessages.value) {
 				// If this message is not condensable, or its an action affecting our user,
 				// then just append the message to container and be done with it
 				if (message.self || message.highlight || !condensedTypes.has(message.type || "")) {
@@ -246,13 +309,34 @@ export default defineComponent({
 			message: SharedMsg | CondensedMessageContainer,
 			id: number
 		) => {
-			const previousMessage = condensedMessages.value[id - 1];
+			let previousMessage = condensedMessages.value[id - 1];
+
+			if (!previousMessage) {
+				const firstId =
+					message.type === "condensed" ? message.messages[0].id : Number(message.id);
+				let previousIndex = getMessageIndexById(props.channel.messages, firstId) - 1;
+
+				if (store.state.settings.statusMessages === "hidden") {
+					while (
+						previousIndex >= 0 &&
+						condensedTypes.has(props.channel.messages[previousIndex].type || "")
+					) {
+						previousIndex--;
+					}
+				}
+
+				previousMessage = props.channel.messages[previousIndex];
+			}
 
 			if (!previousMessage) {
 				return true;
 			}
 
-			const oldDate = new Date(previousMessage.time);
+			const previousTime =
+				previousMessage.type === "condensed"
+					? previousMessage.messages.at(-1)!.time
+					: previousMessage.time;
+			const oldDate = new Date(previousTime);
 			const newDate = new Date(message.time);
 
 			return (
@@ -262,13 +346,35 @@ export default defineComponent({
 			);
 		};
 
-		const shouldDisplayUnreadMarker = (id: number) => {
-			if (!unreadMarkerShown && id > props.channel.firstUnread) {
-				unreadMarkerShown = true;
-				return true;
+		const unreadBoundaryId = computed(() => {
+			const hideStatusMessages = store.state.settings.statusMessages === "hidden";
+			let index = getFirstMessageIndexAfterId(
+				props.channel.messages,
+				props.channel.firstUnread
+			);
+
+			if (hideStatusMessages) {
+				while (
+					index < props.channel.messages.length &&
+					condensedTypes.has(props.channel.messages[index].type || "")
+				) {
+					index++;
+				}
 			}
 
-			return false;
+			return props.channel.messages[index]?.id;
+		});
+
+		const shouldDisplayUnreadMarker = (message: ClientMessage | CondensedMessageContainer) => {
+			const boundaryId = unreadBoundaryId.value;
+
+			if (boundaryId === undefined) {
+				return false;
+			}
+
+			return message.type === "condensed"
+				? message.messages.some((candidate) => candidate.id === boundaryId)
+				: message.id === boundaryId;
 		};
 
 		const isPreviousSource = (currentMessage: ClientMessage, id: number) => {
@@ -289,41 +395,350 @@ export default defineComponent({
 			}
 		};
 
-		const keepScrollPosition = async () => {
-			// If we are already waiting for the next tick to force scroll position,
-			// we have no reason to perform more checks and set it again in the next tick
-			if (isWaitingForNextTick.value) {
+		const getScrollAnchor = (
+			el: HTMLElement,
+			anchorEdge: "first" | "last",
+			visibleOnly = false
+		): ScrollAnchor | undefined => {
+			const chatBounds = el.getBoundingClientRect();
+
+			const isVisible = (element: HTMLElement) => {
+				const bounds = element.getBoundingClientRect();
+				return (
+					bounds.height > 0 &&
+					bounds.bottom > chatBounds.top &&
+					bounds.top < chatBounds.bottom
+				);
+			};
+
+			const messages = Array.from(
+				el.querySelectorAll<HTMLElement>('.messages [id^="msg-"]')
+			).filter((element) => !visibleOnly || isVisible(element));
+			const message = anchorEdge === "first" ? messages[0] : messages[messages.length - 1];
+
+			if (message) {
+				return {
+					messageId: Number(message.id.slice(4)),
+					top: message.getBoundingClientRect().top,
+					condensed: false,
+				};
+			}
+
+			const containers = Array.from(
+				el.querySelectorAll<HTMLElement>('.messages > .msg[data-type="condensed"]')
+			).filter((element) => !visibleOnly || isVisible(element));
+			const container =
+				anchorEdge === "first" ? containers[0] : containers[containers.length - 1];
+
+			if (!container) {
 				return;
 			}
 
+			return {
+				messageId: Number(
+					anchorEdge === "first"
+						? container.dataset.lastMessageId
+						: container.dataset.firstMessageId
+				),
+				top: container.getBoundingClientRect().top,
+				condensed: true,
+			};
+		};
+
+		const restoreScrollAnchor = (el: HTMLElement, anchor: ScrollAnchor | undefined) => {
+			if (!anchor || !Number.isFinite(anchor.messageId)) {
+				return false;
+			}
+
+			let nextAnchor = anchor.condensed
+				? undefined
+				: el.querySelector<HTMLElement>(`#msg-${anchor.messageId}`) ?? undefined;
+
+			if (!nextAnchor) {
+				nextAnchor = Array.from(
+					el.querySelectorAll<HTMLElement>('.messages > .msg[data-type="condensed"]')
+				).find(
+					(container) =>
+						Number(container.dataset.firstMessageId) <= anchor.messageId &&
+						Number(container.dataset.lastMessageId) >= anchor.messageId
+				);
+			}
+
+			if (!nextAnchor) {
+				return false;
+			}
+
+			const delta = nextAnchor.getBoundingClientRect().top - anchor.top;
+
+			if (Math.abs(delta) > 0.5) {
+				skipNextScrollEvent.value = true;
+				el.scrollTop += delta;
+			}
+
+			return true;
+		};
+
+		const rememberVisibleScrollAnchor = () => {
+			const el = chat.value;
+
+			resizeScrollAnchor =
+				el && !props.channel.scrolledToBottom
+					? getScrollAnchor(el, "first", true)
+					: undefined;
+		};
+
+		const handleMessageResize = () => {
+			const el = chat.value;
+
+			if (!el || props.channel.scrolledToBottom) {
+				resizeScrollAnchor = undefined;
+				return;
+			}
+
+			const anchor = windowScrollAnchor ?? resizeScrollAnchor;
+
+			if (restoreScrollAnchor(el, anchor)) {
+				resizeScrollAnchor = anchor;
+			} else {
+				rememberVisibleScrollAnchor();
+			}
+		};
+
+		const keepScrollPosition = async () => {
 			const el = chat.value;
 
 			if (!el) {
 				return;
 			}
 
-			if (!props.channel.scrolledToBottom) {
-				if (props.channel.historyLoading) {
-					const heightOld = el.scrollHeight - el.scrollTop;
+			const generation = scrollAnchorGeneration;
 
-					isWaitingForNextTick.value = true;
+			if (windowTransitioning.value) {
+				const anchor = windowScrollAnchor;
 
-					await nextTick();
+				await nextTick();
 
-					isWaitingForNextTick.value = false;
-					skipNextScrollEvent.value = true;
-
-					el.scrollTop = el.scrollHeight - heightOld;
+				if (generation === scrollAnchorGeneration && restoreScrollAnchor(el, anchor)) {
+					resizeScrollAnchor = anchor;
 				}
 
 				return;
 			}
 
-			isWaitingForNextTick.value = true;
-			await nextTick();
-			isWaitingForNextTick.value = false;
+			if (!props.channel.scrolledToBottom) {
+				const anchor = resizeScrollAnchor ?? getScrollAnchor(el, "first", true);
+				const heightOld = props.channel.historyLoading
+					? el.scrollHeight - el.scrollTop
+					: undefined;
+				const overflowAnchor = el.style.overflowAnchor;
 
-			jumpToBottom();
+				if (heightOld !== undefined) {
+					el.style.overflowAnchor = "none";
+				}
+
+				try {
+					await nextTick();
+
+					if (generation !== scrollAnchorGeneration) {
+						return;
+					}
+
+					const anchorRestored = restoreScrollAnchor(el, anchor);
+
+					if (anchorRestored && heightOld !== undefined) {
+						for (let frame = 0; frame < 2; frame++) {
+							await new Promise<void>((resolve) =>
+								requestAnimationFrame(() => resolve())
+							);
+
+							if (generation === scrollAnchorGeneration) {
+								restoreScrollAnchor(el, anchor);
+							}
+						}
+					}
+
+					if (anchorRestored) {
+						resizeScrollAnchor = anchor;
+					} else if (heightOld !== undefined) {
+						const target = el.scrollHeight - heightOld;
+
+						if (Math.abs(el.scrollTop - target) > 1) {
+							skipNextScrollEvent.value = true;
+							el.scrollTop = target;
+						}
+
+						rememberVisibleScrollAnchor();
+					} else {
+						rememberVisibleScrollAnchor();
+					}
+				} finally {
+					if (heightOld !== undefined) {
+						el.style.overflowAnchor = overflowAnchor;
+					}
+				}
+
+				return;
+			}
+
+			await nextTick();
+
+			if (generation === scrollAnchorGeneration && props.channel.scrolledToBottom) {
+				jumpToBottom();
+			}
+		};
+
+		const keepAnchorWhile = async (updateWindow: () => void, anchorEdge: "first" | "last") => {
+			const el = chat.value;
+
+			if (!el) {
+				updateWindow();
+				return;
+			}
+
+			const anchor = getScrollAnchor(el, anchorEdge);
+			const overflowAnchor = el.style.overflowAnchor;
+			const generation = ++scrollAnchorGeneration;
+			windowScrollAnchor = anchor;
+			resizeScrollAnchor = anchor;
+			el.style.overflowAnchor = "none";
+
+			try {
+				updateWindow();
+				await nextTick();
+
+				if (generation === scrollAnchorGeneration) {
+					restoreScrollAnchor(el, anchor);
+				}
+
+				for (let frame = 0; frame < 2; frame++) {
+					await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+					if (generation === scrollAnchorGeneration) {
+						restoreScrollAnchor(el, anchor);
+					}
+				}
+
+				if (generation === scrollAnchorGeneration) {
+					resizeScrollAnchor = anchor;
+				}
+			} finally {
+				windowScrollAnchor = undefined;
+				el.style.overflowAnchor = overflowAnchor;
+			}
+		};
+
+		const showOlderMessages = async () => {
+			if (windowTransitioning.value) {
+				return;
+			}
+
+			if (!messageWindow.value.hasOlder) {
+				onShowMoreClick();
+				return;
+			}
+
+			windowTransitioning.value = true;
+
+			try {
+				props.channel.scrolledToBottom = false;
+				await keepAnchorWhile(() => {
+					props.channel.messageWindowStart = moveMessageWindow(
+						props.channel.messages.length,
+						props.channel.messageWindowStart,
+						"older"
+					);
+					updateTrackedWindowFirstId();
+				}, "first");
+			} finally {
+				windowTransitioning.value = false;
+			}
+		};
+
+		const showNewerMessages = async () => {
+			if (windowTransitioning.value) {
+				return;
+			}
+
+			const nextStart = moveMessageWindow(
+				props.channel.messages.length,
+				props.channel.messageWindowStart,
+				"newer"
+			);
+			windowTransitioning.value = true;
+
+			try {
+				props.channel.scrolledToBottom = false;
+				await keepAnchorWhile(() => {
+					props.channel.messageWindowStart = nextStart;
+					updateTrackedWindowFirstId();
+				}, "last");
+
+				if (!getMessageWindow(props.channel.messages.length, nextStart).hasNewer) {
+					jumpToBottom();
+				}
+			} finally {
+				windowTransitioning.value = false;
+			}
+		};
+
+		const revealMessage = async (
+			messageId: number,
+			isCurrent: () => boolean = () => true
+		): Promise<boolean> => {
+			const index = props.channel.messages.findIndex((message) => message.id === messageId);
+
+			if (index < 0 || !isCurrent()) {
+				return false;
+			}
+
+			props.channel.scrolledToBottom = false;
+			scrollAnchorGeneration++;
+			props.channel.messageWindowStart = getWindowStartForIndex(
+				props.channel.messages.length,
+				index
+			);
+			updateTrackedWindowFirstId();
+			await nextTick();
+			await nextTick();
+
+			if (!isCurrent()) {
+				return false;
+			}
+
+			const message = chat.value?.querySelector<HTMLElement>(`#msg-${messageId}`);
+
+			if (!message) {
+				return false;
+			}
+
+			scrollAnchorGeneration++;
+			message.scrollIntoView({block: "center"});
+			resizeScrollAnchor = {
+				messageId,
+				top: message.getBoundingClientRect().top,
+				condensed: false,
+			};
+			return true;
+		};
+
+		const syncFocusedMessage = async (focused: number | undefined) => {
+			const sequence = ++focusedRevealSequence;
+			const isCurrent = () => sequence === focusedRevealSequence;
+			const revealed = Number.isFinite(focused)
+				? await revealMessage(Number(focused), isCurrent)
+				: false;
+
+			if (isCurrent() && !revealed) {
+				jumpToBottom();
+			}
+		};
+
+		const revealMessageByMsgid = async (msgid: string) => {
+			const message = props.channel.messages.find((candidate) => candidate.msgid === msgid);
+
+			if (message) {
+				await revealMessage(message.id);
+			}
 		};
 
 		const onLinkPreviewToggle = async (preview: ClientLinkPreview, message: ClientMessage) => {
@@ -352,7 +767,12 @@ export default defineComponent({
 				return;
 			}
 
-			props.channel.scrolledToBottom = el.scrollHeight - el.scrollTop - el.offsetHeight <= 30;
+			scrollAnchorGeneration++;
+
+			props.channel.scrolledToBottom =
+				!messageWindow.value.hasNewer &&
+				el.scrollHeight - el.scrollTop - el.offsetHeight <= 30;
+			rememberVisibleScrollAnchor();
 		};
 
 		const handleResize = () => {
@@ -367,47 +787,87 @@ export default defineComponent({
 
 			eventbus.on("resize", handleResize);
 
-			void nextTick(() => {
-				if (historyObserver.value && loadMoreButton.value) {
-					historyObserver.value.observe(loadMoreButton.value);
-				}
-			});
+			void nextTick()
+				.then(async () => {
+					if (window.IntersectionObserver && chat.value) {
+						historyObserver.value = new window.IntersectionObserver(
+							onLoadButtonObserved,
+							{root: chat.value}
+						);
+					}
+
+					if (window.ResizeObserver && messageContainer.value) {
+						messageResizeObserver.value = new window.ResizeObserver(
+							handleMessageResize
+						);
+						messageResizeObserver.value.observe(messageContainer.value);
+					}
+
+					if (historyObserver.value && loadMoreButton.value) {
+						historyObserver.value.observe(loadMoreButton.value);
+					}
+
+					await syncFocusedMessage(props.focused);
+				})
+				.catch((e) => {
+					// eslint-disable-next-line no-console
+					console.error("Error while initializing message list", e);
+				});
 		});
 
 		watch(
-			() => props.channel.id,
-			() => {
-				props.channel.scrolledToBottom = true;
+			() => [props.channel.id, props.focused, store.state.settings.statusMessages] as const,
+			async (
+				[channelId, focused, statusMessages],
+				[previousChannelId, previousFocused, previousStatusMessages]
+			) => {
+				const channelChanged = channelId !== previousChannelId;
+				const focusChanged = !Object.is(focused, previousFocused);
 
-				// Re-add the intersection observer to trigger the check again on channel switch
-				// Otherwise if last channel had the button visible, switching to a new channel won't trigger the history
-				if (historyObserver.value && loadMoreButton.value) {
-					historyObserver.value.unobserve(loadMoreButton.value);
-					historyObserver.value.observe(loadMoreButton.value);
+				if (channelChanged || focusChanged || Number.isFinite(focused)) {
+					await syncFocusedMessage(focused);
+				} else if (statusMessages !== previousStatusMessages) {
+					await keepScrollPosition();
+				}
+
+				if (channelChanged) {
+					// Re-add the intersection observer to trigger the check again on channel switch
+					// Otherwise if last channel had the button visible, switching to a new channel won't trigger the history
+					if (historyObserver.value && loadMoreButton.value) {
+						historyObserver.value.disconnect();
+						historyObserver.value.observe(loadMoreButton.value);
+					}
 				}
 			}
 		);
 
 		watch(
-			() => props.channel.messages.length,
-			async () => {
+			() => getMessageCollectionSignature(props.channel.messages),
+			async (current, previous) => {
+				const shouldFindPreservedIndex =
+					!props.channel.scrolledToBottom &&
+					current.firstId !== previous.firstId &&
+					current.lastId !== previous.lastId;
+				const preservedIndex = shouldFindPreservedIndex
+					? props.channel.messages.findIndex(
+							(message) => message.id === trackedWindowFirstId
+					  )
+					: -1;
+				props.channel.messageWindowStart = reconcileMessageWindow(
+					props.channel.messageWindowStart,
+					previous,
+					current,
+					props.channel.scrolledToBottom,
+					preservedIndex
+				);
+				updateTrackedWindowFirstId();
 				await keepScrollPosition();
-			}
+			},
+			{deep: true}
 		);
-
-		watch(
-			() => props.channel.pendingMessage,
-			async () => {
-				// Keep the scroll stuck when input gets resized while typing
-				await keepScrollPosition();
-			}
-		);
-
-		onBeforeUpdate(() => {
-			unreadMarkerShown = false;
-		});
 
 		onBeforeUnmount(() => {
+			focusedRevealSequence++;
 			eventbus.off("resize", handleResize);
 			chat.value?.removeEventListener("scroll", handleScroll);
 		});
@@ -416,20 +876,30 @@ export default defineComponent({
 			if (historyObserver.value) {
 				historyObserver.value.disconnect();
 			}
+
+			if (messageResizeObserver.value) {
+				messageResizeObserver.value.disconnect();
+			}
 		});
 
 		return {
 			chat,
+			messageContainer,
 			store,
 			onShowMoreClick,
 			loadMoreButton,
 			onCopy,
 			condensedMessages,
+			messageWindow,
+			windowTransitioning,
 			shouldDisplayDateMarker,
 			shouldDisplayUnreadMarker,
 			keepScrollPosition,
 			isPreviousSource,
 			jumpToBottom,
+			showOlderMessages,
+			showNewerMessages,
+			revealMessageByMsgid,
 			onLinkPreviewToggle,
 		};
 	},

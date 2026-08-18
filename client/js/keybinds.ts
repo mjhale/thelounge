@@ -230,10 +230,13 @@ document.addEventListener("keydown", (e) => {
 		return;
 	}
 
-	const tagName = (e.target as HTMLElement).tagName;
-
-	// Ignore if we're already typing into <input> or <textarea>
-	if (tagName === "INPUT" || tagName === "TEXTAREA") {
+	// Do not steal keyboard activation or text input from interactive controls
+	if (
+		e.target instanceof Element &&
+		e.target.closest(
+			'input, textarea, button, select, a[href], [contenteditable="true"], [role="button"]'
+		)
+	) {
 		return;
 	}
 

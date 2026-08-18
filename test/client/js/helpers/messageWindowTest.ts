@@ -1,13 +1,17 @@
 import {MessageType} from "../../../../shared/types/msg";
 import type {ClientMessage} from "../../../../client/js/types";
 import {
-	createMessageIdSet,
+	addMessageId,
+	createMessageIdIndex,
+	getFirstMessageIndexAfterId,
+	getMessageIndexById,
 	getMessageCollectionSignature,
 	getMessageWindow,
 	getTailWindowStart,
 	getWindowStartForIndex,
 	messageWindowSize,
 	moveMessageWindow,
+	removeMessageIds,
 	reconcileMessageWindow,
 } from "../../../../client/js/helpers/messageWindow";
 
@@ -57,18 +61,18 @@ describe("message window", () => {
 
 		expect(reachable.size).toBe(length);
 		expect(getMessageWindow(length, getTailWindowStart(length))).toEqual({
-			start: 9500,
+			start: 9750,
 			end: 10000,
 			hasOlder: true,
 			hasNewer: false,
 		});
 	});
 
-	it("preserves the rendered identities when history is prepended", () => {
+	it("keeps an overlap while exposing newly prepended history", () => {
 		const previous = getMessageCollectionSignature(makeMessages(5001, messageWindowSize));
-		const current = getMessageCollectionSignature(makeMessages(4001, 1500));
+		const current = getMessageCollectionSignature(makeMessages(4001, 1250));
 
-		expect(reconcileMessageWindow(0, previous, current, false)).toBe(1000);
+		expect(reconcileMessageWindow(0, previous, current, false)).toBe(875);
 	});
 
 	it("preserves an older window for scrolled-up appends", () => {
@@ -78,25 +82,59 @@ describe("message window", () => {
 		expect(reconcileMessageWindow(750, previous, current, false)).toBe(750);
 	});
 
+	it("preserves a scrolled-up window when a reconnect changes no messages", () => {
+		const signature = getMessageCollectionSignature(makeMessages(1, 1000));
+
+		expect(reconcileMessageWindow(375, signature, {...signature}, false)).toBe(375);
+	});
+
 	it("follows the tail when a capped append changes both endpoints", () => {
 		const previous = getMessageCollectionSignature(makeMessages(1, 1500));
 		const current = getMessageCollectionSignature(makeMessages(2, 1500));
 
-		expect(reconcileMessageWindow(1000, previous, current, true)).toBe(1000);
+		expect(reconcileMessageWindow(1000, previous, current, true)).toBe(1250);
+	});
+
+	it("preserves a surviving window anchor when both collection endpoints change", () => {
+		const previous = getMessageCollectionSignature(makeMessages(1001, 2000));
+		const currentMessages = makeMessages(1, 4000);
+		const current = getMessageCollectionSignature(currentMessages);
+		const preservedIndex = currentMessages.findIndex((message) => message.id === 1751);
+
+		expect(reconcileMessageWindow(750, previous, current, false, preservedIndex)).toBe(1750);
+	});
+
+	it("finds unread boundaries in logarithmic collection lookups", () => {
+		const messages = makeMessages(101, 10000);
+
+		expect(getFirstMessageIndexAfterId(messages, 100)).toBe(0);
+		expect(getFirstMessageIndexAfterId(messages, 5100)).toBe(5000);
+		expect(getFirstMessageIndexAfterId(messages, 10100)).toBe(10000);
+		expect(getMessageIndexById(messages, 5101)).toBe(5000);
+		expect(getMessageIndexById(messages, 100)).toBe(-1);
 	});
 
 	it("centers focused and reply targets without leaving the collection", () => {
 		expect(getWindowStartForIndex(10000, 20)).toBe(0);
-		expect(getWindowStartForIndex(10000, 5000)).toBe(4750);
-		expect(getWindowStartForIndex(10000, 9999)).toBe(9500);
+		expect(getWindowStartForIndex(10000, 5000)).toBe(4875);
+		expect(getWindowStartForIndex(10000, 9999)).toBe(9750);
 	});
 
-	it("indexes reply parents once for constant-time membership checks", () => {
-		const messageIds = createMessageIdSet(makeMessages(1, 10000));
+	it("maintains reply-parent membership incrementally, including duplicate IDs", () => {
+		const messages = makeMessages(1, 10000);
+		const messageIds = createMessageIdIndex(messages);
+		const duplicate = {...messages[0]};
+		addMessageId(messageIds, duplicate);
 
 		expect(messageIds.size).toBe(10000);
 		expect(messageIds.has("msg-1")).toBe(true);
 		expect(messageIds.has("msg-10000")).toBe(true);
 		expect(messageIds.has("msg-10001")).toBe(false);
+		expect(messageIds.get("msg-1")).toBe(2);
+
+		removeMessageIds(messageIds, [messages[0]]);
+		expect(messageIds.get("msg-1")).toBe(1);
+		removeMessageIds(messageIds, [duplicate]);
+		expect(messageIds.has("msg-1")).toBe(false);
 	});
 });

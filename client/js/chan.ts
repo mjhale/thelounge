@@ -3,11 +3,13 @@ import {SharedNetworkChan} from "../../shared/types/network";
 import {SharedMsg} from "../../shared/types/msg";
 import {ChanType} from "../../shared/types/chan";
 import {extractInputHistory} from "./helpers/inputHistory";
+import {createMessageIdIndex, getTailWindowStart} from "./helpers/messageWindow";
 
 export function toClientChan(shared: SharedNetworkChan): ClientChan {
 	const history: string[] = [""].concat(extractInputHistory(shared.messages, 99));
 	// filter the unused vars
 	const {messages, totalMessages: _, ...props} = shared;
+	const clientMessages = sharedMsgToClientMsg(messages);
 	const channel: ClientChan = {
 		...props,
 		editTopic: false,
@@ -15,13 +17,15 @@ export function toClientChan(shared: SharedNetworkChan): ClientChan {
 		inputHistoryPosition: 0,
 		historyLoading: false,
 		scrolledToBottom: true,
+		messageWindowStart: getTailWindowStart(clientMessages.length),
+		messageIds: createMessageIdIndex(clientMessages),
 		typingNicks: [],
 		users: [],
 		usersOutdated: shared.type === ChanType.CHANNEL ? true : false,
 		moreHistoryAvailable: shared.totalMessages > shared.messages.length,
 		inputHistory: history,
 		replyingTo: null,
-		messages: sharedMsgToClientMsg(messages),
+		messages: clientMessages,
 	};
 	return channel;
 }

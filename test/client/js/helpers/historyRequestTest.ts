@@ -22,6 +22,8 @@ function makeChannel(): ClientChan {
 		inputHistory: [""],
 		historyLoading: false,
 		scrolledToBottom: false,
+		messageWindowStart: 0,
+		messageIds: new Map(),
 		usersOutdated: false,
 		typingNicks: [],
 		replyingTo: null,

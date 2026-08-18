@@ -28,6 +28,8 @@ type ClientChan = Omit<SharedChan, "messages"> & {
 	inputHistory: string[];
 	historyLoading: boolean;
 	scrolledToBottom: boolean;
+	messageWindowStart: number;
+	messageIds: Map<string, number>;
 	usersOutdated: boolean;
 	typingNicks: string[];
 	replyingTo: {msgid: string; nick: string; text: string} | null;

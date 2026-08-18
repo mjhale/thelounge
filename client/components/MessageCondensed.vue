@@ -1,24 +1,37 @@
 <template>
-	<div :class="['msg', {closed: isCollapsed}]" data-type="condensed">
+	<div
+		:class="['msg', {closed: isCollapsed}]"
+		:data-first-message-id="messages[0].id"
+		:data-last-message-id="messages.at(-1)?.id"
+		data-type="condensed"
+	>
 		<div class="condensed-summary">
 			<span class="time" />
 			<span class="from" />
 			<span class="content" @click="onCollapseClick"
 				>{{ condensedText
-				}}<button class="toggle-button" aria-label="Toggle status messages"
+				}}<button
+					class="toggle-button"
+					aria-label="Toggle status messages"
+					:aria-expanded="!isCollapsed"
 			/></span>
 		</div>
-		<Message
-			v-for="message in messages"
-			:key="message.id"
-			:network="network"
-			:message="message"
-		/>
+		<template v-if="!isCollapsed">
+			<Message
+				v-for="message in messages"
+				:key="message.id"
+				:network="network"
+				:message="message"
+				:message-ids="messageIds"
+				:reveal-message="revealMessage"
+				:focused="message.id === focused"
+			/>
+		</template>
 	</div>
 </template>
 
 <script lang="ts">
-import {computed, defineComponent, PropType, ref} from "vue";
+import {computed, defineComponent, PropType, ref, watch} from "vue";
 import {condensedTypes} from "../../shared/irc";
 import {MessageType} from "../../shared/types/msg";
 import {ClientMessage, ClientNetwork} from "../js/types";
@@ -39,10 +52,25 @@ export default defineComponent({
 			type: Function as PropType<() => void>,
 			required: true,
 		},
-		focused: Boolean,
+		focused: Number,
+		messageIds: {
+			type: Object as PropType<ReadonlyMap<string, number>>,
+			required: false,
+		},
+		revealMessage: Function as PropType<(msgid: string) => Promise<void>>,
 	},
 	setup(props) {
 		const isCollapsed = ref(true);
+
+		watch(
+			() => props.focused,
+			(focused) => {
+				if (props.messages.some((message) => message.id === focused)) {
+					isCollapsed.value = false;
+				}
+			},
+			{immediate: true}
+		);
 
 		const onCollapseClick = () => {
 			isCollapsed.value = !isCollapsed.value;

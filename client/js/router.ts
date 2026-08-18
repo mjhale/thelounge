@@ -1,4 +1,5 @@
 import constants from "./constants";
+import {removeMessageIds} from "./helpers/messageWindow";
 
 import {createRouter, createWebHashHistory} from "vue-router";
 import SignIn from "../components/Windows/SignIn.vue";
@@ -163,7 +164,8 @@ router.afterEach((to) => {
 		}
 
 		if (channel.messages?.length > 100) {
-			channel.messages.splice(0, channel.messages.length - 100);
+			const removed = channel.messages.splice(0, channel.messages.length - 100);
+			removeMessageIds(channel.messageIds, removed);
 			channel.moreHistoryAvailable = true;
 		}
 	}

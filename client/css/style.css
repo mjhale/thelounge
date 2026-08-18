@@ -1292,6 +1292,11 @@ textarea.input {
 	margin: 0;
 }
 
+#chat .show-newer {
+	padding-top: 0;
+	padding-bottom: 15px;
+}
+
 .scroll-down {
 	position: absolute;
 	bottom: 16px;

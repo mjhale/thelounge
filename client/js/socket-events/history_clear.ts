@@ -6,6 +6,7 @@ socket.on("history:clear", function (data) {
 
 	if (netChan?.channel) {
 		netChan.channel.messages = [];
+		netChan.channel.messageIds.clear();
 		netChan.channel.unread = 0;
 		netChan.channel.highlight = 0;
 		netChan.channel.firstUnread = 0;

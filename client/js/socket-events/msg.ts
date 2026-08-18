@@ -5,6 +5,7 @@ import {switchToChannel} from "../router";
 import {ClientChan, NetChan, ClientMessage} from "../types";
 import {SharedMsg, MessageType} from "../../../shared/types/msg";
 import {ChanType} from "../../../shared/types/chan";
+import {addMessageId, removeMessageIds} from "../helpers/messageWindow";
 import popSrc from "../../audio/pop.wav?url";
 
 let pop;
@@ -68,6 +69,7 @@ socket.on("msg", function (data) {
 	}
 
 	channel.messages.push(data.msg);
+	addMessageId(channel.messageIds, data.msg);
 
 	if (data.msg.self) {
 		channel.firstUnread = data.msg.id;
@@ -87,7 +89,8 @@ socket.on("msg", function (data) {
 	}
 
 	if (messageLimit > 0 && channel.messages.length > messageLimit) {
-		channel.messages.splice(0, channel.messages.length - messageLimit);
+		const removed = channel.messages.splice(0, channel.messages.length - messageLimit);
+		removeMessageIds(channel.messageIds, removed);
 		channel.moreHistoryAvailable = true;
 	}
 
